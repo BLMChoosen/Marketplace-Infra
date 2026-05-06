@@ -1,0 +1,220 @@
+# ──────────────────────────────────────────────────────────────
+# Marketplace — Top-level orchestrator
+#
+# Pulls in the per-repo compose files from the sibling
+# Marketplace-Backend and Marketplace-Frontend repositories,
+# and adds the shared infrastructure services.
+#
+# Expected layout (siblings under the same parent dir):
+#   ├── Marketplace-Backend/
+#   │   ├── docker-compose.yml
+#   │   └── .env
+#   ├── Marketplace-Frontend/
+#   │   ├── docker-compose.yml
+#   │   └── .env.local
+#   └── Marketplace-Infra/      ← run `docker compose up` from here
+#       ├── docker-compose.yml
+#       └── .env
+# ──────────────────────────────────────────────────────────────
+
+include:
+  - path: ../Marketplace-Backend/docker-compose.yml
+    env_file: ../Marketplace-Backend/.env
+  - path: ../Marketplace-Frontend/docker-compose.yml
+    env_file: ../Marketplace-Frontend/.env.local
+
+services:
+  # ─────────────────────────────────────────────
+  # PostgreSQL — Main relational database
+  # ─────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: marketplace-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-marketplace}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marketplace_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-marketplace_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-marketplace}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - marketplace-net
+
+  # ─────────────────────────────────────────────
+  # PostgreSQL (Test) — Isolated DB for automated tests
+  # ─────────────────────────────────────────────
+  db_test:
+    image: postgres:16-alpine
+    container_name: marketplace-db-test
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${TEST_POSTGRES_USER:-marketplace_test}
+      POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD:-marketplace_test_secret}
+      POSTGRES_DB: ${TEST_POSTGRES_DB:-marketplace_test_db}
+    ports:
+      - "${TEST_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pg_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TEST_POSTGRES_USER:-marketplace_test}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - marketplace-net
+
+  # ─────────────────────────────────────────────
+  # Redis — Cache, sessions, rate limiting
+  # ─────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: marketplace-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_secret}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - marketplace-net
+
+  # ─────────────────────────────────────────────
+  # Elasticsearch — Full-text product search
+  # ─────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.1
+    container_name: marketplace-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks:
+      - marketplace-net
+
+  # ─────────────────────────────────────────────
+  # RabbitMQ — Message broker for Celery workers
+  # ─────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: marketplace-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-marketplace}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-rabbitmq_secret}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - marketplace-net
+
+  # ─────────────────────────────────────────────
+  # Nginx — Reverse proxy (frontend + API + WS)
+  # ─────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: marketplace-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    networks:
+      - marketplace-net
+
+  # ─────────────────────────────────────────────
+  # Prometheus — Metrics scraping
+  # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: marketplace-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - backend
+    networks:
+      - marketplace-net
+
+  # ─────────────────────────────────────────────
+  # Grafana — Dashboards
+  # ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: marketplace-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-grafana_secret}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - marketplace-net
+
+volumes:
+  pg_data:
+    driver: local
+  pg_test_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  es_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  marketplace-net:
+    name: marketplace-net
+    driver: bridge
